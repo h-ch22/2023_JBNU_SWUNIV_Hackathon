@@ -1,256 +1,271 @@
-import copy
+import gc
 import os
-import time
 
-import torch
-import torchvision
-
-import matplotlib.pyplot as plt
 import numpy as np
-import torch.nn.functional as F
-import torchvision.transforms as transforms
-import torch.nn as nn
-import os
+import pandas as pd
+import torch
+import warnings
+import re
+from sklearn.metrics import accuracy_score
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader
+from timm.optim import AdamP
 
-from PIL import Image
-from torch import Tensor, optim
-from torch.autograd import Variable
-from torch.utils.data import Dataset, DataLoader, TensorDataset
-from sklearn import datasets, model_selection
-from CoverCNN import CoverCNN
-from EfficientNet import EfficientNet
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from transformers import RobertaTokenizer, RobertaForSequenceClassification
+from torch.optim import AdamW
+from tqdm import tqdm
 
-def createFolder(directory):
-    try:
-        if not os.path.exists(directory):
-            os.makedirs(directory)
-    except OSError:
-        print('Error')
-
-def get_lr(opt):
-    for param_group in opt.param_groups:
-        return param_group['lr']
+from models.BertDataset import BertDataset
+from models.TestDataset import TestDataset
 
 
-# calculate the metric per mini-batch
-def metric_batch(output, target):
-    pred = output.argmax(1, keepdim=True)
-    corrects = pred.eq(target.view_as(pred)).sum().item()
-    return corrects
+def clean_text(texts):
+    corpus = []
+    for i in range(0, len(texts)):
+        review = re.sub(r'[@%\\*=()/~#&\+á?\xc3\xa1\-\|\.\:\;\!\-\,\_\~\$\'\"\n\]\[\>]', '',
+                        texts[i])
+        review = re.sub(r'\s+', ' ', review)
+        review = re.sub(r'<[^>]+>', '', review)
+        review = re.sub(r'\s+', ' ', review)
+        review = re.sub(r"^\s+", '', review)
+        review = re.sub(r'\s+$', '', review)
+        review = re.sub(r'_', ' ', review)
+        corpus.append(review)
+
+    return corpus
 
 
-# calculate the loss per mini-batch
-def loss_batch(loss_func, output, target, opt=None):
-    loss_b = loss_func(output, target)
-    metric_b = metric_batch(output, target)
+def train(model, NUM_EPOCHS, train_dataloader, val_dataloader):
+    loss_fn = torch.nn.CrossEntropyLoss()
 
-    if opt is not None:
-        opt.zero_grad()
-        loss_b.backward()
-        opt.step()
+    loss_values = []
 
-    return loss_b.item(), metric_b
+    for epoch in range(NUM_EPOCHS):
 
+        print("")
+        print('======== Epoch {:} / {:} ========'.format(epoch + 1, NUM_EPOCHS))
 
-# calculate the loss per epochs
-def loss_epoch(model, loss_func, dataset_dl, sanity_check=False, opt=None):
-    running_loss = 0.0
-    running_metric = 0.0
-    len_data = len(dataset_dl.dataset)
+        stacked_val_labels = []
+        targets_list = []
 
-    for xb, yb in dataset_dl:
-        xb = xb.to(device)
-        yb = yb.to(device)
-        output = model(xb)
+        # Training
 
-        loss_b, metric_b = loss_batch(loss_func, output, yb, opt)
-
-        running_loss += loss_b
-
-        if metric_b is not None:
-            running_metric += metric_b
-
-        if sanity_check is True:
-            break
-
-    loss = running_loss / len_data
-    metric = running_metric / len_data
-    return loss, metric
-
-def train_val(model, params):
-    num_epochs=params['num_epochs']
-    loss_func=params['loss_func']
-    opt=params['optimizer']
-    train_dl=params['train_dl']
-    val_dl=params['val_dl']
-    sanity_check=params['sanity_check']
-    lr_scheduler=params['lr_scheduler']
-    path2weights=params['path2weights']
-
-    loss_history = {'train': [], 'val': []}
-    metric_history = {'train': [], 'val': []}
-
-    best_loss = float('inf')
-    best_model_wts = copy.deepcopy(model.state_dict())
-    start = time.time()
-
-    for epoch in range(num_epochs):
-        current_lr = get_lr(opt)
-        print('Epoch {}/{}, current lr= {}'.format(epoch, num_epochs - 1, current_lr))
+        print('Training...')
 
         model.train()
-        train_loss, train_metric = loss_epoch(model, loss_func, train_dl, sanity_check, opt)
-        loss_history['train'].append(train_loss)
-        metric_history['train'].append(train_metric)
+        torch.set_grad_enabled(True)
+
+        total_train_loss = 0
+
+        for i, batch in enumerate(tqdm(train_dataloader)):
+            train_status = 'Batch ' + str(i) + ' of ' + str(len(train_dataloader))
+
+            print(train_status, end='\r')
+
+            b_input_ids = batch[0].to(device)
+            b_input_mask = batch[1].to(device)
+            b_labels = batch[2].to(device)
+
+            model.zero_grad()
+
+            outputs = model(b_input_ids,
+                            attention_mask=b_input_mask)
+
+            loss = loss_fn(outputs[0], b_labels)
+
+            total_train_loss = total_train_loss + loss.item()
+
+            optimizer.zero_grad()
+
+            loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+            optimizer.step()
+
+        print('\nTrain loss:', total_train_loss)
+
+        # Validation
+
+        print('\n==========Validation==========')
 
         model.eval()
-        with torch.no_grad():
-            val_loss, val_metric = loss_epoch(model, loss_func, val_dl, sanity_check)
-        loss_history['val'].append(val_loss)
-        metric_history['val'].append(val_metric)
 
-        if val_loss < best_loss:
-            best_loss = val_loss
-            best_model_wts = copy.deepcopy(model.state_dict())
-            torch.save(model.state_dict(), path2weights)
-            print('Copied best model weights!')
+        torch.set_grad_enabled(False)
 
-        lr_scheduler.step(val_loss)
-        if current_lr != get_lr(opt):
-            print('Loading best model weights!')
-            model.load_state_dict(best_model_wts)
+        total_val_loss = 0
 
-        print('train loss: %.6f, val loss: %.6f, accuracy: %.2f, time: %.4f min' % (
-        train_loss, val_loss, 100 * val_metric, (time.time() - start) / 60))
-        print('-' * 10)
+        for j, batch in enumerate(tqdm(val_dataloader)):
 
-    model.load_state_dict(best_model_wts)
-    return model, loss_history, metric_history
+            val_status = 'Batch ' + str(j) + ' of ' + str(len(val_dataloader))
+
+            print(val_status, end='\r')
+
+            b_input_ids = batch[0].to(device)
+            b_input_mask = batch[1].to(device)
+            b_labels = batch[2].to(device)
+
+            outputs = model(b_input_ids,
+                            attention_mask=b_input_mask)
+
+            preds = outputs[0]
+
+            loss = loss_fn(preds, b_labels)
+            total_val_loss = total_val_loss + loss.item()
+
+            val_preds = preds.detach().cpu().numpy()
+
+            targets_np = b_labels.to('cpu').numpy()
+
+            targets_list.extend(targets_np)
+
+            if j == 0:
+                stacked_val_preds = val_preds
+
+            else:
+                stacked_val_preds = np.vstack((stacked_val_preds, val_preds))
+
+        y_true = targets_list
+        y_pred = np.argmax(stacked_val_preds, axis=1)
+
+        val_acc = accuracy_score(y_true, y_pred)
+
+        print('Val loss:', total_val_loss)
+        print('Val acc: ', val_acc)
+
+        torch.save(model, f'./output_roBerta/roBerta_epoch_{epoch}_acc{val_acc}_model.pt')
+
+        gc.collect()
+
+
+def convert_category_to_index(label):
+    indexes = []
+
+    CATEGORIES = {
+        'Arts, Photography': 0, 'Biographies, Memoirs': 1, 'Calendars': 2,
+        'Childrens Books': 3, 'Computers, Technology': 4, 'Cookbooks, Food, Wine': 5,
+        'Crafts, Hobbies, Home': 6, 'Education, Teaching': 7, 'Engineering, Transportation': 8,
+        'Health, Fitness, Dieting': 9, 'Humor, Entertainment': 10, 'Law': 11,
+        'Literature, Fiction': 12, 'Medical Books': 13, 'Mystery, Thriller, Suspense': 14,
+        'Parenting, Relationships': 15, 'Reference': 16, 'Religion, Spirituality': 17,
+        'Science Fiction, Fantasy': 18, 'Science, Math': 19, 'Self Help': 20,
+        'Sports, Outdoors': 21, 'Test Preparation': 22, 'Travel': 23
+    }
+
+    for i in range(0, len(label)):
+        indexes.append(CATEGORIES.get(label[i]))
+
+    return indexes
+
+
+def convert_index_to_category(index):
+    CATEGORIES = {
+        'Arts, Photography': 0, 'Biographies, Memoirs': 1, 'Calendars': 2,
+        'Childrens Books': 3, 'Computers, Technology': 4, 'Cookbooks, Food, Wine': 5,
+        'Crafts, Hobbies, Home': 6, 'Education, Teaching': 7, 'Engineering, Transportation': 8,
+        'Health, Fitness, Dieting': 9, 'Humor, Entertainment': 10, 'Law': 11,
+        'Literature, Fiction': 12, 'Medical Books': 13, 'Mystery, Thriller, Suspense': 14,
+        'Parenting, Relationships': 15, 'Reference': 16, 'Religion, Spirituality': 17,
+        'Science Fiction, Fantasy': 18, 'Science, Math': 19, 'Self Help': 20,
+        'Sports, Outdoors': 21, 'Test Preparation': 22, 'Travel': 23
+    }
+
+    return list(CATEGORIES)[index]
 
 
 if __name__ == '__main__':
-    CATEGORIES = {0: 'ART', 1: 'BUSINESS', 2: 'CHILD', 3: 'COMIC', 4: 'ELESCHOOL_REF', 5: 'ESSAY', 6: 'EXAMINATION', 7: 'FOREIGN_LANGUAGE',
-                  8: 'HEALTH', 9: 'HISTORY', 10: 'HOBBY', 11: 'HOME', 12: 'HUMANITIES', 13: 'IT', 14: 'JUNIOR', 15: 'MAGAZINE', 16: 'MID_HIGHSCHOOL_REF',
-                  17: 'NOVEL', 18: 'RELIGION', 19: 'SCIENCE', 20: 'SELF-DEVELOPMENT', 21: 'SOCIAL', 22: 'TECHNICAL',
-                  23: 'TEENAGER', 24: 'TRIP'}
+    warnings.filterwarnings("ignore")
 
-    # TRAIN_PATH = 'C:/Users/USER/Desktop/2023/JBNU_SWUNIV_HACKATHON/DATA/TRAIN/'
-    TRAIN_PATH = '/Users/changjinha/Desktop/2023/JBNU_SWUNIV_HACKATHON/DATA/TRAIN/'
+    torch.manual_seed(1016)
 
-    data = []
-    label = []
-    # device = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
-    device = torch.device('mps:0' if torch.backends.mps.is_available() else 'cpu')
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
-    for i, d in enumerate(CATEGORIES.values()):
-        files = os.listdir(TRAIN_PATH + d)
+    train_df = pd.read_csv('./data/train_data.csv', skiprows=0)
+    test_df = pd.read_csv('./data/test_data.csv', skiprows=0)
+    submit_df = pd.read_csv('./data/sample_submission.csv')
 
-        for f in files:
-            if '.jpg' in f:
-                img = Image.open(TRAIN_PATH + d + '/' + f, 'r')
-                resize_img = img.resize((224, 224))
+    train_df['Title'] = clean_text(train_df['Title'])
+    test_df['Title'] = clean_text(test_df['Title'])
 
-                r, g, b = resize_img.split()
-                r_resize_img = np.asarray(np.float32(r) / 255.0)
-                b_resize_img = np.asarray(np.float32(g) / 255.0)
-                g_resize_img = np.asarray(np.float32(b) / 255.0)
+    train_df['label'] = convert_category_to_index(train_df['label'])
 
-                rgb_resize_img = np.asarray([r_resize_img, b_resize_img, g_resize_img])
+    tokenizer = RobertaTokenizer.from_pretrained("roberta-large")
 
-                data.append(rgb_resize_img)
-                label.append(i)
+    train_dataset, val_dataset = train_test_split(train_df, test_size=0.1)
+    train_dataset = train_dataset.reset_index(drop=True)
+    val_dataset = val_dataset.reset_index(drop=True)
 
-    data = np.array(data, dtype='float32')
-    label = np.array(label, dtype='int64')
+    NUM_EPOCHS = 10
+    L_RATE = 1e-5
+    MAX_LEN = 512
 
-    train_X, test_X, train_Y, test_Y = model_selection.train_test_split(data, label, test_size=0.1)
+    TRAIN_BATCH_SIZE = 4
+    TEST_BATCH_SIZE = 1
 
-    train_X = torch.from_numpy(train_X).float()
-    train_Y = torch.from_numpy(train_Y).long()
+    NUM_CORES = os.cpu_count()
+    print("NUM_CORES of CPU : ", NUM_CORES)
 
-    test_X = torch.from_numpy(test_X).float()
-    test_Y = torch.from_numpy(test_Y).long()
+    train_data = BertDataset(train_dataset)
+    val_data = BertDataset(val_dataset)
+    test_data = TestDataset(test_df)
 
-    train = TensorDataset(train_X, train_Y)
-    train_loader = DataLoader(train, batch_size=80, shuffle=True)
+    train_dataloader = DataLoader(train_data,
+                                  batch_size=TRAIN_BATCH_SIZE,
+                                  shuffle=True,
+                                  num_workers=NUM_CORES)
 
-    test = TensorDataset(test_X, test_Y)
-    test_loader = DataLoader(test, batch_size=80, shuffle=True)
+    val_dataloader = DataLoader(val_data,
+                                batch_size=TRAIN_BATCH_SIZE,
+                                shuffle=True,
+                                num_workers=NUM_CORES)
 
-    print(train_X.shape)
+    test_dataloader = DataLoader(test_data,
+                                 batch_size=TEST_BATCH_SIZE,
+                                 shuffle=False,
+                                 num_workers=NUM_CORES)
 
-    efficientNet = EfficientNet()
-    model = efficientNet.efficientnet_b0().to(device)
+    model = RobertaForSequenceClassification.from_pretrained(
+        "roberta-large",
+        num_labels=24,
+    )
+    model.to(device)
 
-    loss_func = nn.CrossEntropyLoss(reduction='sum')
-    opt = optim.Adam(model.parameters(), lr=0.01)
+    optimizer = AdamP(model.parameters(), lr=2e-5)
 
-    lr_scheduler = ReduceLROnPlateau(opt, mode='min', factor=0.1, patience=10)
+    train(model, NUM_EPOCHS, train_dataloader, val_dataloader)
 
-    params_train = {
-        'num_epochs': 100,
-        'optimizer': opt,
-        'loss_func': loss_func,
-        'train_dl': train_loader,
-        'val_dl': test_loader,
-        'sanity_check': False,
-        'lr_scheduler': lr_scheduler,
-        'path2weights': './models/weights.pt',
-    }
-    createFolder('./models')
-    model, loss_hist, metric_hist = train_val(model, params_train)
+    # model = torch.load(r'./output/epoch_3_acc0.7053428446644344_model.pt')
+    model = torch.load(r'./output/epoch_9_acc0.6966079487552773_model.pt')
+    model.to(device)
 
+    results = []
 
-    # learning_rate = 0.001
-    # model = CoverCNN()
-    # efficientNet = EfficientNet()
-    # model = efficientNet.efficientnet_b0().to(device)
-    #
-    # model.to(device)
-    #
-    # criterion = nn.CrossEntropyLoss()
-    # optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    # num_epochs = 200
-    # count = 0
-    # loss_list = []
-    # iteration_list = []
-    # accuracy_list = []
-    #
-    # predictions_list = []
-    # labels_list = []
-    #
-    # for epoch in range(num_epochs):
-    #     for images, labels in train_loader:
-    #         images, labels = images.to(device), labels.to(device)
-    #         train = Tensor(images.view(-1, 3, 128, 128))
-    #         labels = Tensor(labels)
-    #         outputs = model(train)
-    #         loss = criterion(outputs, labels)
-    #         optimizer.zero_grad()
-    #         loss.backward()
-    #         optimizer.step()
-    #         count += 1
-    #
-    #         if not (count % 50):
-    #             total = 0
-    #             correct = 0
-    #
-    #             for images, labels in test_loader:
-    #                 images, labels = images.to(device), labels.to(device)
-    #                 labels_list.append(labels)
-    #                 test = Tensor(images.view(-1, 3, 128, 128))
-    #                 outputs = model(test)
-    #
-    #                 predictions = torch.max(outputs, 1)[1].to(device)
-    #                 predictions_list.append(predictions)
-    #                 correct += (predictions == labels).sum()
-    #                 total += len(labels)
-    #
-    #                 accuracy = correct * 100 / total
-    #                 loss_list.append(loss.data)
-    #                 iteration_list.append(count)
-    #                 accuracy_list.append(accuracy)
-    #
-    #         if not (count % 500):
-    #             print("Iteration: {}, Loss: {}, Accuracy: {}%".format(count, loss.data, accuracy))
+    for j, batch in enumerate(tqdm(test_dataloader)):
+
+        inference_status = 'Batch ' + str(j + 1) + ' of ' + str(len(test_dataloader))
+
+        print(inference_status, end='\r')
+
+        b_input_ids = batch[0].to(device)
+        b_input_mask = batch[1].to(device)
+
+        outputs = model(b_input_ids,
+                        attention_mask=b_input_mask)
+
+        preds = outputs[0]
+        preds = preds.detach().cpu().numpy()
+
+        if j == 0:
+            stacked_preds = preds
+
+        else:
+            stacked_preds = np.vstack((stacked_preds, preds))
+
+    preds = np.argmax(stacked_preds, axis=1)
+    preds_categorical = []
+
+    for pred in preds:
+        preds_categorical.append(convert_index_to_category(pred))
+
+    submit_df['label'] = preds_categorical
+    submit_df.to_csv(r'C:\Users\USER\Desktop\2023\JBNU_SWUNIV_HACKATHON\Classification\output\submit_E10l.csv', index=False)
